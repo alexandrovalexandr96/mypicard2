@@ -42,8 +42,14 @@ import picard.cmdline.Option;
 import picard.cmdline.StandardOptionDefinitions;
 
 import java.io.File;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Super class that is designed to provide some consistent structure between subclasses that
@@ -125,6 +131,12 @@ public abstract class SinglePassSamProgram extends CommandLineProgram {
 
 
         final ProgressLogger progress = new ProgressLogger(log);
+        
+        int MAX_PACKET = 10;
+        int MAX_PAIRS = 1000;
+        ExecutorService service = Executors.newCachedThreadPool();
+        Semaphore sem = new Semaphore(MAX_PACKET);
+        List<Object[]> pairs = new ArrayList<>(MAX_PAIRS);
 
         for (final SAMRecord rec : in) {
             final ReferenceSequence ref;
@@ -134,10 +146,8 @@ public abstract class SinglePassSamProgram extends CommandLineProgram {
                 ref = walker.get(rec.getReferenceIndex());
             }
 
-            for (final SinglePassSamProgram program : programs) {
-                program.acceptRead(rec, ref);
-            }
-
+            pairs.add(new Object[]{rec, ref});
+            
             progress.record(rec);
 
             // See if we need to terminate early?
@@ -149,7 +159,38 @@ public abstract class SinglePassSamProgram extends CommandLineProgram {
             if (!anyUseNoRefReads && rec.getReferenceIndex() == SAMRecord.NO_ALIGNMENT_REFERENCE_INDEX) {
                 break;
             }
+            
+            if(pairs.size()<MAX_PAIRS)
+            {
+            	continue;
+            }
+            
+            final List<Object[]> tmpPairs = pairs;
+            pairs=new ArrayList<>(MAX_PAIRS);
+            
+            sem.acquireUninterruptibly();
+            service.execute(new Runnable() {
+				
+				@Override
+				public void run() {
+					for(Object[] object : tmpPairs){
+						SAMRecord rec1 = (SAMRecord) object[0];
+						ReferenceSequence ref1 = (ReferenceSequence) object[1];
+					for (final SinglePassSamProgram program : programs) {
+		                program.acceptRead(rec1, ref1);
+						}
+					}
+					sem.release();
+				}
+			});
         }
+        service.shutdown();
+        
+        try {
+			service.awaitTermination(1, TimeUnit.DAYS);
+		} catch (InterruptedException e) {
+			e.printStackTrace();
+		}
 
         CloserUtil.close(in);
 
